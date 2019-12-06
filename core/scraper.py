@@ -3,6 +3,7 @@ import sys
 import csv
 import time
 from random import uniform
+from functools import wraps
 
 from bs4 import BeautifulSoup
 from selenium import webdriver
@@ -19,6 +20,7 @@ from utils import run_time
 
 BASE_URL = 'https://www.vinfolio.com/shop-wine/allWine?show=100'
 FILE = 'out.csv'
+FILE_WITHOUT_IMG = 'out_without_img.csv'
 
 
 class AbstractScraper:
@@ -60,12 +62,12 @@ class AbstractScraper:
 
 
 class Scraper(AbstractScraper):
-    def __init__(self, url: str, display: bool=False, profile: bool=False) -> None:
+    def __init__(self, url: str, display: bool=False, profile: bool=False, js_enabled: bool=False) -> None:
         self.url = url
         self.display = display
-        self.start_driver(profile=profile)
+        self.start_driver(profile=profile, js_enabled=js_enabled)
 
-    def start_driver(self, profile: bool) -> None:
+    def start_driver(self, profile: bool, js_enabled: bool=False) -> None:
         """Starts a new local session of Firefox.
         :return webdriver
         """
@@ -87,7 +89,8 @@ class Scraper(AbstractScraper):
             ## Disable Flash
             firefoxProfile.set_preference('dom.ipc.plugins.enabled.libflashplayer.so', 'false')
             ## Disable JS
-            firefoxProfile.set_preference("javascript.enabled", 'false')
+            if not js_enabled:
+                firefoxProfile.set_preference("javascript.enabled", 'false')
 
         ## Use the driver
         self.driver = webdriver.Firefox(firefox_profile=firefoxProfile)
@@ -99,7 +102,7 @@ class Scraper(AbstractScraper):
 
         :return None
         """
-        # Stop browser
+        # Stop browser (close all windows browser and its process)
         self.driver.quit()
 
         # Stop display
@@ -137,10 +140,19 @@ class Scraper(AbstractScraper):
             print('Reload...')
             self.wait(timeout, period + 2)
 
+    def wrap_stop_driver(f):
+        @wraps(f)
+        def wrapped(inst, *args, **kwargs):
+            try:
+                f(inst, *args, **kwargs)
+            finally:
+                inst.stop_driver()
+        return wrapped
+
+    @wrap_stop_driver
     def parsing(self) -> None:
         self.save_header(FILE)
         self.get_driver(self.url, 15)
-        # self.driver.get(self.url)
 
         # Click on the button confirm and/or close the form("Join us")
         self.click_confirm()
@@ -163,7 +175,7 @@ class Scraper(AbstractScraper):
                 self.get_driver(page, 2)
 
                 # Get links items
-                links = [a.get_attribute('href') for a in self.driver.find_elements_by_css_selector(
+                links = [f"{a.get_attribute('href')}?quantity=1" for a in self.driver.find_elements_by_css_selector(
                     '.facets-facet-browse-items a.facets-item-cell-grid-title')]
                 print(links, links.__len__())
                 for link in links:
@@ -177,7 +189,6 @@ class Scraper(AbstractScraper):
                     # print(items)
         else:
             print('Slow connection. Try to run script again')
-        self.stop_driver()
 
     def save_header(self, path) -> None:
         with open(path, 'w') as csvfile:
@@ -272,9 +283,63 @@ class ItemScraper(Scraper):
         return [self.url, name, image_productname, price]
 
 
+class ScraperWithoutImg(Scraper):
+    __file_without_img = FILE_WITHOUT_IMG
+
+    @Scraper.wrap_stop_driver
+    def parsing(self) -> None:
+        self.save_header(self.__file_without_img)
+        self.get_driver(self.url, 15)
+
+        # Click on the button confirm and/or close the form("Join us")
+        self.click_confirm()
+
+        # Count the quantity of pages
+        try:
+            quantity_pages = \
+            self.driver.find_element_by_css_selector('p.global-views-pagination-count').text.split('of')[-1]
+            quantity_pages = int(quantity_pages.strip())
+            print("[Count pages: {}]".format(quantity_pages))
+        except Exception as e:
+            print(f'{e.__class__.__name__}(Quantity pages): {e}')
+            quantity_pages = None
+
+        # Get pages
+        if quantity_pages:
+            pages = ['{}&page={}'.format(self.url, page) for page in range(1, quantity_pages + 1)]
+            # print(pages)
+
+            for page in pages:
+                print("Scraping page: ", page)
+                self.get_driver(page, 2)
+
+                # Get links items where there are no pictures
+                src = 'https://www.vinfolio.com/sca-dev-kilimanjaro/img/no_image_available.jpeg?resizeid=2&resizeh=230&resizew=295'
+                try:
+                    items_without_img = self.driver.find_elements_by_css_selector("img[src='{}']".format(src))
+                    links = [f"{item.find_element_by_xpath('../../a').get_attribute('href')}?quantity=1"
+                             for item in items_without_img]
+                except Exception as e:
+                    print(f'{e.__class__.__name__}(Links without img): {e}')
+                    links = None
+
+                for link in links:
+                    try:
+                        ##### Scraping an item
+                        items = ItemScraper(self.driver, link).parsing()
+                        self.save(items, self.__file_without_img)
+                    except Exception as e:
+                        print(e)
+                        items = None
+                    # print(items)
+        else:
+            print('Slow connection. Try to run script again')
+
 @run_time
 def main():
-    scraper = Scraper(BASE_URL, profile=True)
+    # scraper = Scraper(BASE_URL, profile=True)
+    # scraper.parsing()
+    scraper = ScraperWithoutImg(BASE_URL)
     scraper.parsing()
 
 if __name__ == '__main__':
